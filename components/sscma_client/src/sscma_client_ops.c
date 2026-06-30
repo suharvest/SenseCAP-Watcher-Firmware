@@ -230,7 +230,11 @@ static void sscma_client_process(void *arg)
                 }
             }
 
-            sscma_client_read(client, client->rx_buffer.data + client->rx_buffer.pos, rlen);
+            if (sscma_client_read(client, client->rx_buffer.data + client->rx_buffer.pos, rlen) != ESP_OK)
+            {
+                ESP_LOGW(TAG, "sscma_client_read failed (likely OOM), dropping this round");
+                continue;
+            }
             client->rx_buffer.pos += rlen;
 
             int new_pos = 0;
