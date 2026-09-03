@@ -151,6 +151,15 @@ void sscma_client_reply_clear(sscma_client_reply_t *reply)
     reply->len = 0;
 }
 
+void sscma_client_set_drop_events(sscma_client_handle_t client, bool drop)
+{
+    if (client == NULL)
+    {
+        return;
+    }
+    client->drop_events = drop;
+}
+
 static void sscma_client_monitor(void *arg)
 {
     sscma_client_handle_t client = (sscma_client_handle_t)arg;
@@ -265,6 +274,19 @@ static void sscma_client_process(void *arg)
                         client->rx_buffer.pos -= len;
 
                         reply.data[len] = 0;
+
+                        // Drop event frames (type:1) before JSON parsing when requested.
+                        // Anchored to the exact 11-byte frame head "\r{"type": 1" emitted
+                        // by the WE2 firmware for events — avoids building the ~8KB cJSON
+                        // tree in internal SRAM during the wake window (TLS handshake).
+                        if (client->drop_events && strncmp(reply.data, "\r{\"type\": 1", 11) == 0)
+                        {
+                            free(reply.data);
+                            reply.data = NULL;
+                            reply.len = 0;
+                            continue;
+                        }
+
                         reply.payload = cJSON_Parse(reply.data);
                         if (reply.payload != NULL)
                         {
@@ -282,6 +304,13 @@ static void sscma_client_process(void *arg)
                             {
                                 if (name != NULL && strnstr(name->valuestring, EVENT_INIT, strlen(name->valuestring)) != NULL)
                                 {
+                                    // Drain and free stale replies before resetting the queue,
+                                    // otherwise their data/payload allocations leak.
+                                    sscma_client_reply_t stale;
+                                    while (xQueueReceive(client->reply_queue, &stale, 0) == pdTRUE)
+                                    {
+                                        sscma_client_reply_clear(&stale);
+                                    }
                                     xQueueReset(client->reply_queue); // reset reply queue
                                     if (xQueueSend(client->reply_queue, &reply, 0) != pdTRUE)
                                     {
@@ -420,7 +449,12 @@ static void sscma_client_process(void *arg)
                         }
                     }else{
                         printf("reply.data == NULL\r\n");
-                        client->rx_buffer.pos -= len;
+                        // OOM: still consume this frame from the rx buffer, mirroring the
+                        // discard path below — otherwise the buffer state is corrupted.
+                        memmove(client->rx_buffer.data, suffix + RESPONSE_SUFFIX_LEN,
+                                client->rx_buffer.pos - (suffix - client->rx_buffer.data) - RESPONSE_SUFFIX_LEN);
+                        client->rx_buffer.pos -= suffix - client->rx_buffer.data + RESPONSE_SUFFIX_LEN;
+                        client->rx_buffer.data[client->rx_buffer.pos] = 0;
                     }
                 }
                 else
